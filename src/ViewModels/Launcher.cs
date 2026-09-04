@@ -1,6 +1,7 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Text;
+using System.Threading;
 
 using Avalonia.Collections;
 using Avalonia.Threading;
@@ -515,6 +516,24 @@ namespace SourceGit.ViewModels
             page.Data = null;
         }
 
+        /// <summary>
+        ///     Deliberately delayed: cycling through tabs should only refresh the one actually
+        ///     landed on, not every tab passed through on the way.
+        /// </summary>
+        private void ScheduleActivatedRefresh()
+        {
+            _activatedRefreshTimer?.Dispose();
+            _activatedRefreshTimer = new Timer(
+                _ => Dispatcher.UIThread.Post(() =>
+                {
+                    if (_activePage is { Data: Repository repo })
+                        repo.RefreshOnActivated();
+                }),
+                null,
+                ACTIVATED_REFRESH_DELAY,
+                Timeout.Infinite);
+        }
+
         private void PostActivePageChanged()
         {
             if (_ignoreIndexChange)
@@ -522,6 +541,8 @@ namespace SourceGit.ViewModels
 
             if (_activePage is { Data: Repository repo })
                 _activeWorkspace.ActiveIdx = _activeWorkspace.Repositories.IndexOf(repo.FullPath);
+
+            ScheduleActivatedRefresh();
 
             var builder = new StringBuilder(512);
             builder.Append(string.IsNullOrEmpty(_activePage.Node.Name) ? "Repositories" : _activePage.Node.Name);
@@ -534,6 +555,9 @@ namespace SourceGit.ViewModels
             CommandPalette = null;
         }
 
+        private const int ACTIVATED_REFRESH_DELAY = 400;
+
+        private Timer _activatedRefreshTimer = null;
         private Workspace _activeWorkspace;
         private LauncherPage _activePage;
         private bool _ignoreIndexChange;

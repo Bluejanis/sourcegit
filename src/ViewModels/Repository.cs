@@ -653,8 +653,26 @@ namespace SourceGit.ViewModels
             return log;
         }
 
+        /// <summary>
+        ///     Re-read this repository because its tab was brought to the front.
+        ///
+        ///     A watcher normally keeps an open repository current, but it can miss changes - one
+        ///     that died, or an inotify queue overflow - and nothing else re-reads a tab that is
+        ///     already open. Skipped when it was refreshed moments ago, so opening a tab does not
+        ///     immediately refresh what Open() has just loaded.
+        /// </summary>
+        public void RefreshOnActivated()
+        {
+            if ((DateTime.Now - _lastRefreshAt).TotalSeconds < ACTIVATED_REFRESH_MIN_AGE_SECONDS)
+                return;
+
+            RefreshAll();
+        }
+
         public void RefreshAll()
         {
+            _lastRefreshAt = DateTime.Now;
+
             RefreshCommits();
             RefreshBranches();
             RefreshTags();
@@ -1988,6 +2006,9 @@ namespace SourceGit.ViewModels
         private bool _hasAllowedSignersFile = false;
         private ulong _queryLocalChangesTimes = 0;
 
+        private const int ACTIVATED_REFRESH_MIN_AGE_SECONDS = 5;
+
+        private DateTime _lastRefreshAt = DateTime.MinValue;
         private Models.Watcher _watcher = null;
         private Histories _histories = null;
         private WorkingCopy _workingCopy = null;
