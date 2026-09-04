@@ -30,6 +30,13 @@ namespace SourceGit.Models
             _root = new DirectoryInfo(fullpath).FullName;
             _watchers = new List<FileSystemWatcher>();
 
+            if (new WSL() { Path = fullpath }.IsWSLPath())
+            {
+                _wslWatcher = new WslWatcher(fullpath, OnWslChanged);
+                _timer = new Timer(Tick, null, 100, 100);
+                return;
+            }
+
             var testGitDir = new DirectoryInfo(Path.Combine(fullpath, ".git")).FullName;
             var desiredDir = new DirectoryInfo(gitDir).FullName;
             if (testGitDir.Equals(desiredDir, StringComparison.Ordinal))
@@ -125,6 +132,9 @@ namespace SourceGit.Models
 
         public void Dispose()
         {
+            _wslWatcher?.Dispose();
+            _wslWatcher = null;
+
             foreach (var watcher in _watchers)
             {
                 watcher.EnableRaisingEvents = false;
@@ -263,6 +273,38 @@ namespace SourceGit.Models
             HandleWorkingCopyFileChanged(name, e.FullPath);
         }
 
+        private void OnWslChanged(string line)
+        {
+            // The poll fallback knows something changed but not what, so refresh broadly.
+            if (line.Equals(WslWatcher.AnyChange, StringComparison.Ordinal))
+            {
+                var desired = DateTime.Now.AddSeconds(.5).ToFileTime();
+                Interlocked.Exchange(ref _updateBranch, desired);
+                Interlocked.Exchange(ref _updateTags, desired);
+                Interlocked.Exchange(ref _updateStashes, desired);
+                return;
+            }
+
+            // inotifywait reports paths relative to the directory it was given.
+            var name = line.Replace('\\', '/');
+            if (name.StartsWith("./", StringComparison.Ordinal))
+                name = name.Substring(2);
+            name = name.TrimEnd('/');
+            if (name.Length == 0)
+                return;
+
+            var gitDirAt = -1;
+            if (name.StartsWith(".git/", StringComparison.Ordinal))
+                gitDirAt = 5;
+            else if (name.Contains("/.git/", StringComparison.Ordinal))
+                gitDirAt = name.IndexOf("/.git/", StringComparison.Ordinal) + 6;
+
+            if (gitDirAt >= 0)
+                HandleGitDirFileChanged(name.Substring(gitDirAt));
+            else
+                HandleWorkingCopyFileChanged(name, Path.Combine(_root, name));
+        }
+
         private void HandleGitDirFileChanged(string name)
         {
             if (name.Contains("fsmonitor--daemon/", StringComparison.Ordinal) ||
@@ -353,6 +395,7 @@ namespace SourceGit.Models
         private readonly string _root;
         private List<FileSystemWatcher> _watchers;
         private Timer _timer;
+        private WslWatcher _wslWatcher = null;
 
         private long _lockCount;
         private long _updateWC;
