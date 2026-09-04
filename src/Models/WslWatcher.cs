@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Threading;
 
 namespace SourceGit.Models
 {
@@ -14,48 +15,135 @@ namespace SourceGit.Models
     public class WslWatcher : IDisposable
     {
         /// <summary>
-        ///     Emitted by the poll fallback, which knows that something changed but not what.
+        ///     Reported when the watcher knows that something changed but not what - by the poll
+        ///     fallback, and after a restart, when changes may have been missed while it was down.
         /// </summary>
         public const string AnyChange = "ALL";
 
         public WslWatcher(string fullpath, Action<string> onChanged)
         {
+            _fullpath = fullpath;
             _onChanged = onChanged;
-
-            try
-            {
-                var start = new ProcessStartInfo("wsl");
-                start.ArgumentList.Add("-e");
-                start.ArgumentList.Add("sh");
-                start.ArgumentList.Add("-c");
-                start.ArgumentList.Add(SCRIPT);
-                start.WorkingDirectory = fullpath;
-                start.RedirectStandardOutput = true;
-                start.UseShellExecute = false;
-                start.CreateNoWindow = true;
-
-                _proc = new Process() { StartInfo = start };
-                _proc.OutputDataReceived += OnLineReceived;
-                _proc.Start();
-                _proc.BeginOutputReadLine();
-            }
-            catch
-            {
-                // No watching is the pre-existing behaviour, so degrade to it silently.
-                _proc = null;
-            }
+            Start();
         }
 
         public void Dispose()
         {
-            var proc = _proc;
-            _proc = null;
+            lock (_sync)
+            {
+                if (_disposed)
+                    return;
+
+                _disposed = true;
+                _restartTimer?.Dispose();
+                _restartTimer = null;
+            }
+
+            StopProcess();
+        }
+
+        private void Start()
+        {
+            lock (_sync)
+            {
+                if (_disposed)
+                    return;
+
+                try
+                {
+                    var start = new ProcessStartInfo("wsl");
+                    start.ArgumentList.Add("-e");
+                    start.ArgumentList.Add("sh");
+                    start.ArgumentList.Add("-c");
+                    start.ArgumentList.Add(SCRIPT);
+                    start.WorkingDirectory = _fullpath;
+                    start.RedirectStandardOutput = true;
+                    start.UseShellExecute = false;
+                    start.CreateNoWindow = true;
+
+                    _remotePid = 0;
+                    _proc = new Process() { StartInfo = start, EnableRaisingEvents = true };
+                    _proc.OutputDataReceived += OnLineReceived;
+                    _proc.Exited += OnProcessExited;
+                    _proc.Start();
+                    _proc.BeginOutputReadLine();
+                    _startedAt = DateTime.Now;
+                    return;
+                }
+                catch
+                {
+                    _proc = null;
+                }
+            }
+
+            // Starting failed - back off and try again rather than going silent forever.
+            ScheduleRestart();
+        }
+
+        /// <summary>
+        ///     The distro side can die without the app noticing: `wsl --shutdown`, the VM idle
+        ///     timeout, or the process being killed. Left alone that stops refreshes silently,
+        ///     so bring it back and assume the repository moved on while it was gone.
+        /// </summary>
+        private void OnProcessExited(object sender, EventArgs e)
+        {
+            lock (_sync)
+            {
+                if (_disposed)
+                    return;
+            }
+
+            _onChanged?.Invoke(AnyChange);
+            ScheduleRestart();
+        }
+
+        private void ScheduleRestart()
+        {
+            lock (_sync)
+            {
+                if (_disposed)
+                    return;
+
+                // A watcher that ran for a while was healthy, so treat this as a one-off and
+                // retry promptly. Repeated quick failures back off up to half a minute.
+                var wasHealthy = (DateTime.Now - _startedAt).TotalSeconds >= HEALTHY_AFTER_SECONDS;
+                _restartDelay = wasHealthy
+                    ? MIN_RESTART_DELAY
+                    : Math.Min(_restartDelay * 2, MAX_RESTART_DELAY);
+
+                _restartTimer?.Dispose();
+                _restartTimer = new Timer(_ => Restart(), null, _restartDelay, Timeout.Infinite);
+            }
+        }
+
+        private void Restart()
+        {
+            StopProcess();
+            Start();
+        }
+
+        private void StopProcess()
+        {
+            Process proc;
+            int remotePid;
+
+            lock (_sync)
+            {
+                proc = _proc;
+                remotePid = _remotePid;
+                _proc = null;
+                _remotePid = 0;
+            }
+
             if (proc == null)
                 return;
 
+            proc.Exited -= OnProcessExited;
+            proc.OutputDataReceived -= OnLineReceived;
+
             // The shell traps EXIT and takes inotifywait down with it, but only once it is
             // signalled - killing wsl.exe alone would leave it running inside the distro.
-            if (_remotePid > 0)
+            if (remotePid > 0)
             {
                 try
                 {
@@ -63,7 +151,7 @@ namespace SourceGit.Models
                     kill.ArgumentList.Add("-e");
                     kill.ArgumentList.Add("kill");
                     kill.ArgumentList.Add("-TERM");
-                    kill.ArgumentList.Add(_remotePid.ToString());
+                    kill.ArgumentList.Add(remotePid.ToString());
                     kill.UseShellExecute = false;
                     kill.CreateNoWindow = true;
                     Process.Start(kill)?.WaitForExit(3000);
@@ -96,12 +184,20 @@ namespace SourceGit.Models
             if (line.StartsWith("PID:", StringComparison.Ordinal))
             {
                 if (int.TryParse(line.AsSpan(4), out var pid))
-                    _remotePid = pid;
+                {
+                    lock (_sync)
+                        _remotePid = pid;
+                }
+
                 return;
             }
 
             _onChanged?.Invoke(line);
         }
+
+        private const int MIN_RESTART_DELAY = 1000;
+        private const int MAX_RESTART_DELAY = 30000;
+        private const int HEALTHY_AFTER_SECONDS = 60;
 
         private const string SCRIPT = """
             echo "PID:$$"
@@ -127,8 +223,15 @@ namespace SourceGit.Models
             fi
             """;
 
+        private readonly string _fullpath = string.Empty;
+        private readonly Action<string> _onChanged = null;
+        private readonly Lock _sync = new();
+
         private Process _proc = null;
         private int _remotePid = 0;
-        private readonly Action<string> _onChanged = null;
+        private bool _disposed = false;
+        private int _restartDelay = MIN_RESTART_DELAY;
+        private DateTime _startedAt = DateTime.MinValue;
+        private Timer _restartTimer = null;
     }
 }
